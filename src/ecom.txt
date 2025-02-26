@@ -1,0 +1,297 @@
+
+/// ───── SIMPLE E‑COMMERCE STORE WITH TABS ──────────────────────────────────────
+/// In addition to the products view we now add a “Cart” tab that shows all cart items.
+
+/// Updated Product struct now holds an image source **and an ID**.
+#[derive(Clone)]
+struct Product {
+    id: u32,
+    name: Arc<str>,
+    price: f32,
+    images: Vec<Arc<str>>,
+}
+
+/// A cart struct that tracks the added products.
+#[derive(Clone)]
+struct Cart {
+    // Using a reactive Mutable list so that any changes can update the UI.
+    items: MutableVec<Product>,
+}
+
+impl Cart {
+    fn new() -> Self {
+        Self {
+            items: MutableVec::new(),
+        }
+    }
+
+    fn add_product(&self, product: &Product) {
+        self.items.lock_mut().push_cloned(product.clone());
+    }
+
+    /// Removes the first instance of a product with the matching ID from the cart.
+    fn remove_product(&self, product_id: u32) {
+        let mut items = self.items.lock_mut();
+        if let Some(index) = items.iter().position(|p| p.id == product_id) {
+            items.remove(index);
+        }
+    }
+
+    /// Renders a small cart indicator.
+    fn indicator(state: &Arc<Self>) -> Dom {
+        html!("div", {
+            .style("margin", "1rem")
+            .child_signal(
+                state.items.signal_vec_cloned().len().map(|len| {
+                    Some(html!("div", {
+                        .text(&format!("Cart: {} items", len))
+                    }))
+                })
+            )
+        })
+    }
+
+    /// Renders the full list of items in the cart (the “Cart” tab),
+    /// adding a "Remove" button next to each item.
+    fn render(state: &Arc<Cart>) -> Dom {
+        html!("div", {
+            .style("display", "flex")
+            .style("flex-direction", "column")
+            .style("align-items", "center")
+            .children_signal_vec(state.items.signal_vec_cloned().map(clone!(state => move |product| {
+                html!("div", {
+                    .style("display", "flex")
+                    .style("justify-content", "space-between")
+                    .style("align-items", "center")
+                    .style("width", "300px")
+                    .style("border-bottom", "1px solid #ccc")
+                    .style("padding", "0.5rem")
+                    .children(&mut [
+                        html!("div", {
+                            .text(&format!("{} - ${:.2}", product.name, product.price))
+                        }),
+                        Button::render(
+                                vec![
+                                    html!("div", {
+                                        // give the text some space / padding
+                                        .style("padding-left", "1rem")
+                                        .style("padding-right", "1rem")
+                                        .style("display", "flex")
+                                        .style("align-items", "center")
+                                        // .child(text("Remove").footnote())
+                                        .child(text("Remove").custom(FontStyle::new(11.0, 14.0).weight("800")))
+                                    })
+                                    ],
+                                {
+                                    let product_id = product.id;
+                                    let state = state.clone();
+                                    move |event| {
+                                        if let ButtonEvent::Clicked = event {
+                                            state.remove_product(product_id);
+                                            console::log_1(&format!("Removed {} from cart", product.name).into());
+                                        }
+                                    }
+                                }
+                            )
+                    ])
+                })
+            })))
+        })
+    }
+}
+
+/// Enum to represent the currently selected tab.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Products,
+    Cart,
+}
+
+/// The main application state now holds a list of products, a reactive Cart,
+/// and a reactive tab selection.
+struct App {
+    products: Vec<Product>,
+    cart: Arc<Cart>,
+    selected_tab: Mutable<Tab>,
+}
+
+impl App {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            products: vec![
+                Product {
+                    id: 1,
+                    name: "T‑Shirt".into(),
+                    price: 20.0,
+                    images: vec![
+                        "https://picsum.photos/id/1011/200/200".into(),
+                        "https://picsum.photos/id/1012/200/200".into(),
+                        "https://picsum.photos/id/1013/200/200".into(),
+                    ],
+                },
+                Product {
+                    id: 2,
+                    name: "Hat".into(),
+                    price: 15.0,
+                    images: vec![
+                        "https://picsum.photos/id/1021/200/200".into(),
+                        "https://picsum.photos/id/1022/200/200".into(),
+                        "https://picsum.photos/id/1023/200/200".into(),
+                    ],
+                },
+                Product {
+                    id: 3,
+                    name: "Sneakers".into(),
+                    price: 50.0,
+                    images: vec![
+                        "https://picsum.photos/id/1031/200/200".into(),
+                        "https://picsum.photos/id/1032/200/200".into(),
+                        "https://picsum.photos/id/1033/200/200".into(),
+                    ],
+                },
+            ],
+            cart: Arc::new(Cart::new()),
+            selected_tab: Mutable::new(Tab::Products),
+        })
+    }
+
+    /// Renders the full app with header, tab bar, and tab content.
+    fn render(state: &Arc<Self>) -> Dom {
+        // CSS classes for our product card and list layout.
+        static PRODUCT_CARD_CLASS: Lazy<String> = Lazy::new(|| {
+            class! {
+                .style("border", "1px solid #ccc")
+                .style("padding", "1rem")
+                .style("margin", "0.5rem")
+                .style("border-radius", "0.5rem")
+                .style("width", "200px")
+            }
+            .into()
+        });
+        static PRODUCT_LIST_CLASS: Lazy<String> = Lazy::new(|| {
+            class! {
+                .style("display", "flex")
+                .style("flex-wrap", "wrap")
+                .style("justify-content", "center")
+            }
+            .into()
+        });
+
+        // Header with title and cart indicator.
+        let header = html!("div", {
+            .style("text-align", "center")
+            .children(&mut [
+                text("Simple E‑Commerce Store").large_title(),
+                Cart::indicator(&state.cart)
+            ])
+        });
+
+        // Tab bar letting the user switch between the products view and the cart view.
+        let tab_bar = html!("div", {
+            .style("display", "flex")
+            .style("justify-content", "center")
+            .style("margin", "1rem 0")
+            .children(&mut [
+                html!("div", {
+                    .text("Store")
+                    .style("cursor", "pointer")
+                    .style("margin", "0 1rem")
+                    .event(clone!(state => move |_: events::Click| {
+                        state.selected_tab.set(Tab::Products);
+                    }))
+                }),
+                html!("div", {
+                    .text("Cart")
+                    .style("cursor", "pointer")
+                    .style("margin", "0 1rem")
+                    .event(clone!(state => move |_: events::Click| {
+                        state.selected_tab.set(Tab::Cart);
+                    }))
+                }),
+            ])
+        });
+
+        html!("div", {
+            .style("padding", "1rem")
+            .children(&mut [
+                header,
+                tab_bar,
+                html!("div", {
+                    .child_signal(state.selected_tab.signal().map(clone!(state => move |tab| {
+                        match tab {
+                            Tab::Products => Some(App::render_products(&state, &PRODUCT_CARD_CLASS, &PRODUCT_LIST_CLASS)),
+                            Tab::Cart => Some(Cart::render(&state.cart)),
+                        }
+                    })))
+                })
+            ])
+        })
+    }
+
+    /// Renders the list of products (the “Store” view).
+    fn render_products(
+        state: &Arc<Self>,
+        product_card_class: &str,
+        product_list_class: &str,
+    ) -> Dom {
+        // For each product, render a “card” with its name, price, image, and an “Add to Cart” button.
+        let products_vec: Vec<Dom> = state.products.iter().map(|product| {
+            let product_clone = product.clone();
+
+            html!("div", {
+                .class(product_card_class)
+                .children(&mut [
+                    text(&product_clone.name).title3(),
+                    html!("div", {
+                        .style("margin", "0.5rem 0")
+                        .text(&format!("${:.2}", product_clone.price))
+                    }),
+                    html!("div", {
+                        .style("margin", "0.5rem 0")
+                        .child(
+                            html!("img", {
+                                .style("width", "100%")
+                                .style("border", "1px solid rgba(0, 0, 0, 0.2)")
+                                .style("border-radius", "0.5rem")
+                                .attr("src", &*product_clone.images.first().unwrap_or(&"https://picsum.photos/id/0/200/200".into()))
+                            }))
+                    }),
+                    Button::render(
+                        vec![text("Add to Cart").body()],
+                        {
+                            // Clone our app state for use in the event handler.
+                            let app = state.clone();
+                            // Clone the product so that it can be moved into the closure.
+                            let product_for_event = product_clone.clone();
+                            move |event| {
+                                if let ButtonEvent::Clicked = event {
+                                    app.cart.add_product(&product_for_event);
+                                    console::log_1(&format!("Added {} to cart", product_for_event.name).into());
+                                }
+                            }
+                        }
+                    )
+                ])
+            })
+        }).collect();
+
+        html!("div", {
+            .class(product_list_class)
+            .children(products_vec)
+        })
+    }
+}
+
+/// The entry point. We set up better panic messages in debug mode,
+/// create our App instance, render it, and append it to the document body.
+#[wasm_bindgen(start)]
+pub fn main_js() -> Result<(), JsValue> {
+    // Enable better panic messages in debug mode.
+    #[cfg(debug_assertions)]
+    console_error_panic_hook::set_once();
+
+    let app = App::new();
+    dominator::append_dom(&dominator::body(), App::render(&app));
+
+    Ok(())
+}

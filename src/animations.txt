@@ -1,0 +1,994 @@
+
+// -------------------------------------------------------------------
+// AnimationConfig holds the parameters for both the spring and linear opacity.
+// -------------------------------------------------------------------
+#[derive(Clone, Copy)]
+struct AnimationConfig {
+    mass: f32,
+    stiffness: f32,
+    damping: f32,
+    initial: f32,
+    target: f32,
+    delay_factor: f32,
+    start_delay: f32,
+    opacity_duration: f32, // Duration (in seconds) for the opacity animation.
+}
+
+// -------------------------------------------------------------------
+// Spring is a basic spring physics simulation.
+// -------------------------------------------------------------------
+#[derive(Debug)]
+struct Spring {
+    mass: f32,
+    stiffness: f32,
+    damping: f32,
+    value: f32,
+    target: f32,
+    velocity: f32,
+}
+
+impl Spring {
+    fn new_with_config(config: &AnimationConfig) -> Self {
+        Self {
+            mass: config.mass,
+            stiffness: config.stiffness,
+            damping: config.damping,
+            value: config.initial,
+            target: config.initial,
+            velocity: 0.0,
+        }
+    }
+
+    /// Update the spring state by a small time-step (dt, in seconds).
+    fn update(&mut self, dt: f32) {
+        let displacement = self.value - self.target;
+        let force = -self.stiffness * displacement - self.damping * self.velocity;
+        let acceleration = force / self.mass;
+        self.velocity += acceleration * dt;
+        self.value += self.velocity * dt;
+    }
+}
+
+// -------------------------------------------------------------------
+// WordAnimating holds the spring and linear opacity for one word.
+// -------------------------------------------------------------------
+struct WordAnimating {
+    word: String,
+    delay: f32,
+    spring: RefCell<Spring>,
+    spring_value: Mutable<f32>,
+    opacity_value: Mutable<f32>,
+    has_reached_target: Cell<bool>,
+    active: Cell<bool>,
+}
+
+impl WordAnimating {
+    fn new(word: &str, delay: f32, config: &AnimationConfig) -> Self {
+        Self {
+            word: word.to_string(),
+            delay,
+            spring: RefCell::new(Spring::new_with_config(config)),
+            spring_value: Mutable::new(config.initial),
+            // Start opacity at 0.
+            opacity_value: Mutable::new(0.0),
+            has_reached_target: Cell::new(false),
+            active: Cell::new(false),
+        }
+    }
+
+    /// Update both the spring physics and the linear opacity.
+    ///
+    /// - `elapsed` is the time in seconds since this text’s animation started (after start_delay).
+    /// - `dt` is the per‑frame delta time.
+    /// - `config` holds the animation configuration.
+    fn update(&self, elapsed: f32, dt: f32, config: &AnimationConfig) {
+        const SPRING_THRESHOLD: f32 = 0.005;
+        const OPACITY_THRESHOLD: f32 = 0.01;
+
+        // Update the spring animation.
+        {
+            let mut spring = self.spring.borrow_mut();
+            if (spring.target - config.target).abs() > f32::EPSILON {
+                spring.target = config.target;
+            }
+            spring.update(dt);
+            let new_val = spring.value;
+            if (new_val - self.spring_value.get()).abs() > SPRING_THRESHOLD {
+                self.spring_value.set(new_val);
+            }
+            // Mark as complete if close enough.
+            if (spring.value - spring.target).abs() < 0.001 && spring.velocity.abs() < 0.001 {
+                self.has_reached_target.set(true);
+            }
+        }
+
+        // Update the linear opacity.
+        let progress = ((elapsed - self.delay) / config.opacity_duration)
+            .min(1.0)
+            .max(0.0);
+        if (progress - self.opacity_value.get()).abs() > OPACITY_THRESHOLD {
+            self.opacity_value.set(progress);
+        }
+    }
+}
+
+// -------------------------------------------------------------------
+// Global counter for generating unique IDs for animated text containers.
+// -------------------------------------------------------------------
+static TEXT_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+// -------------------------------------------------------------------
+// Text holds the animated text content and a list of animated words.
+// -------------------------------------------------------------------
+struct Text {
+    content: Rc<str>,
+    animated_words: Vec<WordAnimating>,
+    config: AnimationConfig,
+    animation_complete: Mutable<bool>,
+    // A unique id for the container.
+    id: String,
+}
+
+impl Text {
+    /// Create a new Text instance.
+    fn new(content: Rc<str>, config: AnimationConfig) -> Rc<Self> {
+        // Split the text into words.
+        let words: Vec<&str> = content.split_whitespace().collect();
+        let animated_words: Vec<WordAnimating> = words
+            .into_iter()
+            .enumerate()
+            .map(|(i, word)| {
+                let delay = i as f32 * config.delay_factor;
+                WordAnimating::new(word, delay, &config)
+            })
+            .collect();
+
+        // Generate a unique id for this text container.
+        let id = format!(
+            "animated-text-container-{}",
+            TEXT_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+
+        let text = Rc::new(Self {
+            content,
+            animated_words,
+            config,
+            animation_complete: Mutable::new(false),
+            id,
+        });
+
+        // Register this text into the global active list.
+        ACTIVE_TEXTS.with(|texts| texts.borrow_mut().push(text.clone()));
+        text
+    }
+
+    /// Update this text’s animation:
+    ///
+    /// - Compute effective elapsed time (global elapsed minus start_delay).
+    /// - Activate words once their individual delay has passed.
+    /// - Update each active word.
+    /// - Mark the text complete when all words are done.
+    fn update_all(&self, global_elapsed: f32, dt: f32) {
+        // Compute the local elapsed time (after the text’s overall start_delay).
+        let elapsed = global_elapsed - self.config.start_delay;
+        if elapsed < 0.0 {
+            return;
+        }
+
+        let mut all_done = true;
+        for word in &self.animated_words {
+            // Activate the word when its delay is reached.
+            if !word.active.get() && elapsed >= word.delay {
+                word.active.set(true);
+            }
+            // Update only active words that haven't completed.
+            if word.active.get() && !word.has_reached_target.get() {
+                word.update(elapsed, dt, &self.config);
+                all_done = false;
+            }
+        }
+
+        if all_done {
+            self.animation_complete.set(true);
+        }
+    }
+
+    /// Render the text. While the animation is running, we render each word individually.
+    /// Once finished, we render the whole text as one span.
+    fn render(text: Rc<Self>) -> Dom {
+        html!("span", {
+            // Use the unique id for this text element.
+            .attr("id", &text.id)
+            .child_signal(text.animation_complete.signal().map(clone!(text => move |complete| {
+                if complete {
+                    // Render plain text when animation is done.
+                    Some(html!("span", {
+                        .text(&*text.content)
+                    }))
+                } else {
+                    // Render each animated word.
+                    Some(html!("span", {
+                        .children(text.animated_words.iter().enumerate().map(|(i, animated)| {
+                            // Add trailing non-breaking space.
+                            // Only if the word’s index is not the last one.
+                            let trailing_space = if i < text.animated_words.len() - 1 {
+                                "\u{00A0}"
+                            } else {
+                                ""
+                            };
+                            html!("span", {
+                                .style("display", "inline-block")
+                                .style_signal("transform", animated.spring_value.signal().map(|val| {
+                                    format!("translateY({}rem)", val)
+                                }))
+                                .style_signal("opacity", animated.opacity_value.signal().map(|val| {
+                                    val.to_string()
+                                }))
+                                .text(&format!("{}{}", animated.word, trailing_space))
+                            })
+                        }))
+                    }))
+                }
+            })))
+        })
+    }
+}
+
+// -------------------------------------------------------------------
+// Global registry for all animated texts.
+// -------------------------------------------------------------------
+thread_local! {
+    static ACTIVE_TEXTS: RefCell<Vec<Rc<Text>>> = RefCell::new(Vec::new());
+}
+
+// -------------------------------------------------------------------
+// Global flag for whether any animated text is visible in the viewport.
+// -------------------------------------------------------------------
+static TEXT_VISIBLE: Lazy<Mutable<bool>> = Lazy::new(|| Mutable::new(true));
+
+// -------------------------------------------------------------------
+// Global Spring Animations API
+// -------------------------------------------------------------------
+//
+// We first define a trait for objects that can be updated as part of
+// the global animation loop.
+trait GlobalSpring {
+    fn update(&self, dt: f32);
+}
+
+// -------------------------------------------------------------------
+// Button Spring Code (without Mutexes)
+// -------------------------------------------------------------------
+// For the button we define a separate configuration.
+static BUTTON_SPRING_CONFIG: Lazy<AnimationConfig> = Lazy::new(|| {
+    AnimationConfig {
+        mass: 1.0,
+        stiffness: 300.0,
+        damping: 10.0,
+        initial: 0.0, // starting at non-hovered state
+        target: 0.0,
+        delay_factor: 0.0,
+        start_delay: 0.0,
+        opacity_duration: 0.0, // not used for the button
+    }
+});
+
+/// ButtonSpring stores its physics in a RefCell and a futures_signals
+/// `Mutable<f32>` to drive UI updates.
+struct ButtonSpring {
+    spring: RefCell<Spring>,
+    value: RefCell<f32>,
+    value_mut: Mutable<f32>,
+}
+
+impl ButtonSpring {
+    fn new(config: &AnimationConfig) -> Rc<Self> {
+        Rc::new(Self {
+            spring: RefCell::new(Spring {
+                mass: config.mass,
+                stiffness: config.stiffness,
+                damping: config.damping,
+                value: config.initial,
+                target: config.initial,
+                velocity: 0.0,
+            }),
+            value: RefCell::new(config.initial),
+            value_mut: Mutable::new(config.initial),
+        })
+    }
+
+    /// Set the target value of the spring.
+    fn set_target(&self, target: f32) {
+        self.spring.borrow_mut().target = target;
+    }
+}
+
+impl GlobalSpring for ButtonSpring {
+    /// Update the spring physics using the given time-step.
+    fn update(&self, dt: f32) {
+        let mut spring = self.spring.borrow_mut();
+        spring.update(dt);
+        let new_value = spring.value;
+        *self.value.borrow_mut() = new_value;
+        self.value_mut.set(new_value);
+    }
+}
+
+// -------------------------------------------------------------------
+// Global Animation Handler (thread‑local version)
+// -------------------------------------------------------------------
+struct GlobalAnimationHandler {
+    springs: RefCell<Vec<Rc<dyn GlobalSpring>>>,
+}
+
+impl GlobalAnimationHandler {
+    fn new() -> Self {
+        Self {
+            springs: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Adds a new spring to the global handler.
+    fn add_spring(&self, config: &AnimationConfig) -> Rc<ButtonSpring> {
+        let spring = ButtonSpring::new(config);
+        self.springs
+            .borrow_mut()
+            .push(spring.clone() as Rc<dyn GlobalSpring>);
+        spring
+    }
+
+    /// Update all registered springs.
+    fn update_all(&self, dt: f32) {
+        for spring in self.springs.borrow().iter() {
+            spring.update(dt);
+        }
+    }
+}
+
+// Use thread_local! for the global animation handler.
+thread_local! {
+    static GLOBAL_ANIMATION_HANDLER: GlobalAnimationHandler = GlobalAnimationHandler::new();
+}
+
+// -------------------------------------------------------------------
+// Global animation loop.
+// -------------------------------------------------------------------
+async fn global_animation_loop() {
+    let dt: f32 = 0.016; // ~60 fps
+    let mut interval = IntervalStream::new(16);
+    let global_start = Date::now();
+
+    loop {
+        interval.next().await;
+
+        if !TEXT_VISIBLE.get() {
+            continue;
+        }
+        let now = Date::now();
+        let global_elapsed = ((now - global_start) as f32) / 1000.0;
+
+        ACTIVE_TEXTS.with(|texts| {
+            texts.borrow_mut().retain(|text| {
+                text.update_all(global_elapsed, dt);
+                !text.animation_complete.get()
+            });
+        });
+
+        // Use the thread-local global animation handler.
+        GLOBAL_ANIMATION_HANDLER.with(|handler| {
+            handler.update_all(dt);
+        });
+    }
+}
+
+// -------------------------------------------------------------------
+// IntersectionObserver to watch all text containers.
+// -------------------------------------------------------------------
+fn setup_intersection_observer() {
+    let window = window().expect("no global `window` exists");
+    let document = window.document().expect("should have a document on window");
+
+    // Query all elements whose id starts with "animated-text-container"
+    if let Ok(elements) = document.query_selector_all("[id^='animated-text-container']") {
+        let callback = Closure::wrap(Box::new(
+            move |entries: Array, _observer: IntersectionObserver| {
+                let mut any_visible = false;
+                for entry in entries.iter() {
+                    let entry = entry.dyn_into::<IntersectionObserverEntry>().unwrap();
+                    if entry.is_intersecting() {
+                        any_visible = true;
+                        break;
+                    }
+                }
+                TEXT_VISIBLE.set(any_visible);
+            },
+        ) as Box<dyn FnMut(Array, IntersectionObserver)>);
+
+        let options = IntersectionObserverInit::new();
+        options.set_threshold(&Array::of1(&0.1.into()));
+
+        let observer = IntersectionObserver::new(callback.as_ref().unchecked_ref())
+            .expect("Failed to create IntersectionObserver");
+
+        // Observe each animated text container.
+        for i in 0..elements.length() {
+            if let Some(element) = elements.item(i) {
+                if let Some(el) = element.dyn_ref::<web_sys::Element>() {
+                    observer.observe(el);
+                }
+            }
+        }
+
+        // Keep the closure alive.
+        callback.forget();
+    }
+}
+
+// -------------------------------------------------------------------
+// Helper to render animated text.
+// -------------------------------------------------------------------
+fn text(text: &str) -> TextHelper {
+    TextHelper { text }
+}
+
+// -------------------------------------------------------------------
+// TextHelper provides a fluent API for rendering different text styles.
+// -------------------------------------------------------------------
+struct TextHelper<'a> {
+    text: &'a str,
+}
+
+impl TextHelper<'_> {
+    fn large_title(self) -> Dom {
+        static CLASS: Lazy<String> = Lazy::new(|| {
+            class! {
+                .style("font-size", "1.5rem")
+            }
+            .into()
+        });
+
+        static CONFIG: Lazy<AnimationConfig> = Lazy::new(|| AnimationConfig {
+            mass: 1.0,
+            stiffness: 400.0,
+            damping: 11.0,
+            initial: -2.0,
+            target: 0.0,
+            delay_factor: 0.01,
+            start_delay: 0.2,
+            opacity_duration: 0.5,
+        });
+
+        html!("div", {
+            .class(&*CLASS)
+            .children(&mut [
+                Text::render(Text::new(self.text.into(), *CONFIG)),
+            ])
+        })
+    }
+
+    // Additional styles (title, headline, etc.) can be added here.
+    fn title() -> Dom {
+        todo!()
+    }
+
+    fn title2() -> Dom {
+        todo!()
+    }
+
+    fn title3() -> Dom {
+        todo!()
+    }
+
+    fn headline() -> Dom {
+        todo!()
+    }
+
+    fn subheadline() -> Dom {
+        todo!()
+    }
+
+    fn body() -> Dom {
+        todo!()
+    }
+
+    fn callout() -> Dom {
+        todo!()
+    }
+
+    fn footnote() -> Dom {
+        todo!()
+    }
+
+    fn caption() -> Dom {
+        todo!()
+    }
+
+    fn caption2() -> Dom {
+        todo!()
+    }
+}
+
+// -------------------------------------------------------------------
+// Header helper.
+// -------------------------------------------------------------------
+fn header<B, C>(children: C) -> Dom
+where
+    B: std::borrow::BorrowMut<Dom>,
+    C: IntoIterator<Item = B>,
+{
+    html!("div", {
+        .style("position", "absolute")
+        .style("top", "0")
+        .style("left", "0")
+        .style("right", "0")
+        .style("display", "flex")
+        .style("justify-content", "space-between")
+        .style("align-items", "center")
+        // .style("box-shadow", "rgba(100, 100, 111, 0.5) 0px 7px 29px 0px")
+        .style("z-index", "1000")
+        .style("height", "4rem")
+        .style("font-size", "2rem")
+        .children(children)
+    })
+}
+
+
+// -------------------------------------------------------------------
+// Define a simple Project struct.
+// -------------------------------------------------------------------
+struct Project {
+    title: &'static str,
+    description: &'static str,
+    image_url: &'static str,
+}
+
+// -------------------------------------------------------------------
+// Renders a single project card.
+// -------------------------------------------------------------------
+fn project_card(project: &Project) -> Dom {
+    html!("div", {
+        .style("width", "300px")
+        .style("margin", "0 8px")
+        .style("border", "1px solid #ccc")
+        .style("border-radius", "8px")
+        .style("overflow", "hidden")
+        .style("box-shadow", "0 4px 8px rgba(0, 0, 0, 0.1)")
+        .children(&mut [
+            // Image section.
+            html!("img", {
+                .attr("src", project.image_url)
+                .style("width", "100%")
+                .style("height", "200px")
+                .style("object-fit", "cover")
+            }),
+            // Text section.
+            html!("div", {
+                .style("padding", "16px")
+                .children(&mut [
+                    html!("h3", {
+                        .text(project.title)
+                        .style("margin", "0 0 8px 0")
+                    }),
+                    html!("p", {
+                        .text(project.description)
+                        .style("margin", "0")
+                    }),
+                ])
+            }),
+        ])
+    })
+}
+
+// -------------------------------------------------------------------
+// Renders the horizontal card carousel.
+// -------------------------------------------------------------------
+fn card_carousel() -> Dom {
+    // A mutable index that tracks the currently selected card.
+    let current_index = Mutable::new(0);
+
+    // A vector of sample projects. Replace these with your actual projects.
+    let projects = vec![
+        Project {
+            title: "Project One",
+            description: "A brief description of project one.",
+            image_url: "https://placehold.co/300x200",
+        },
+        Project {
+            title: "Project Two",
+            description: "A brief description of project two.",
+            image_url: "https://placehold.co/300x200",
+        },
+        Project {
+            title: "Project Three",
+            description: "A brief description of project three.",
+            image_url: "https://placehold.co/300x200",
+        },
+        Project {
+            title: "Project Four",
+            description: "A brief description of project four.",
+            image_url: "https://placehold.co/300x200",
+        },
+    ];
+
+    // Define card dimensions.
+    let card_height = 300.0; // Each card's height (adjust as needed).
+    let card_margin = 8.0; // Vertical margin around each card.
+    let total_card_height = card_height + 2.0 * card_margin; // Total space per card.
+
+    // Define a fixed viewport height for the carousel.
+    let viewport_height = 500.0;
+
+    // let gradient = ConstEquidistantLinear::<f32, _, 3>::equidistant_unchecked([
+    //     LinSrgb::new(0.00, 0.05, 0.20),
+    //     LinSrgb::new(0.70, 0.10, 0.20),
+    //     LinSrgb::new(0.95, 0.90, 0.30),
+    // ]);
+
+    // let taken_colors: Vec<_> = gradient.take(10).collect();
+
+    // The offset is computed so that the selected card is centered.
+    // For a card at index `i`, its center is at:
+    //    (i * total_card_height + total_card_height/2)
+    // To center it in the viewport, we need a translation of:
+    //    (viewport_height/2 - total_card_height/2) - (i * total_card_height)
+    html!("div", {
+        .style("display", "flex")
+        .style("flex-direction", "column")
+        .style("align-items", "center")
+        .style("justify-content", "center")
+        .style("width", "100%")
+        .style("margin-top", "2rem")
+        .children(&mut [
+            // Up button.
+            html!("button", {
+                .text("▲")
+                .style("background", "none")
+                .style("border", "none")
+                .style("font-size", "2rem")
+                .style("cursor", "pointer")
+                .event(clone!(current_index => move |_: events::Click| {
+                    let idx = *current_index.lock_ref();
+                    if idx > 0 {
+                        current_index.set(idx - 1);
+                    }
+                }))
+            }),
+            // Carousel viewport.
+            html!("div", {
+                .style("width", "100%")
+                .style("height", &format!("{}px", viewport_height))
+                .style("overflow", "hidden")
+                .child(html!("div", {
+                    .style("display", "flex")
+                    .style("flex-direction", "column")
+                    .style("transition", "transform 0.3s ease-out")
+                    // Update the vertical transform so the selected card is centered.
+                   .style_signal("transform", current_index.signal().map(move |idx| {
+                        let offset = (viewport_height / 2.0 - total_card_height / 2.0)
+                            - (idx as f64 * total_card_height);
+                        format!("translateY({}px)", offset)
+                    }))
+                    .children({
+                        projects
+                            .iter()
+                            .map(|project| {
+                                html!("div", {
+                                    .style("height", &format!("{}px", total_card_height))
+                                    .child(project_card(project))
+                                })
+                            })
+                            .collect::<Vec<Dom>>()
+                    })
+
+                }))
+            }),
+            // Down button.
+            html!("button", {
+                .text("▼")
+                .style("background", "none")
+                .style("border", "none")
+                .style("font-size", "2rem")
+                .style("cursor", "pointer")
+                .event(clone!(current_index => move |_: events::Click| {
+                    let idx = *current_index.lock_ref();
+                    if idx < projects.len() - 1 {
+                        current_index.set(idx + 1);
+                    }
+                }))
+            }),
+        ])
+    })
+}
+
+// // -------------------------------------------------------------------
+// // Example: Append the carousel to the body.
+// // You can integrate this into your existing Dominator app as needed.
+// // -------------------------------------------------------------------
+// #[wasm_bindgen(start)]
+// pub fn main_js() -> Result<(), JsValue> {
+//     // (Optional) Enable better panic messages when debugging.
+//     #[cfg(debug_assertions)]
+//     console_error_panic_hook::set_once();
+
+//     // Append the card carousel to the document body.
+//     dominator::append_dom(&dominator::body(), card_carousel());
+//     Ok(())
+// }
+
+// html!("div", {
+//     // Card container styling:
+//     .style("position", "fixed")
+//     .style("top", "50%")
+//     .style("left", "50%")
+//     .style("transform", "translate(-50%, -50%)")
+//     .style("padding", "20px")
+//     .style("box-shadow", "0 4px 8px rgba(0, 0, 0, 0.2)")
+//     .style("border-radius", "8px")
+//     .style("background-color", "#ffffff")
+//     .style("max-width", "300px")
+//     .style("text-align", "center")
+//     // Card content:
+//     .text("This is a card in the middle of the screen!")
+// }),
+
+
+
+// -------------------------------------------------------------------
+// Entry point.
+// -------------------------------------------------------------------
+#[wasm_bindgen(start)]
+pub fn main_js() -> Result<(), JsValue> {
+    // Enable better panic messages.
+    #[cfg(debug_assertions)]
+    console_error_panic_hook::set_once();
+
+    // Create a long text by repeatedly duplicating "Hello, World!".
+    let mut really_long_text: Rc<str> = "Hello, World!".into();
+    for _ in 0..12 {
+        really_long_text = format!("{} {}", really_long_text, really_long_text).into();
+    }
+
+    // Start the global animation loop.
+    spawn_local(global_animation_loop());
+
+    // Append our DOM to the body.
+    dominator::append_dom(
+        &dominator::body(),
+        html!("div", {
+            .children(&mut [
+                // header(vec![
+                //     // html!("div", {
+                //     //     .style("width", "80%")
+                //     //     .style("display", "flex")
+                //     //     .style("justify-content", "center")
+                //     //     .style("align-items", "center")
+                //     // }),
+                //     Button::ghost().render(vec![
+                //         Icon::plus().render(),
+                //     ], move |event| {
+                //         match event {
+                //             ButtonEvent::Clicked => {
+
+                //             }
+                //         }
+                //     }),
+
+                //     Button::ghost().render(vec![
+                //         Icon::plus().render(),
+                //     ], move |event| {
+                //         match event {
+                //             ButtonEvent::Clicked => {
+
+                //             }
+                //         }
+                //     }),
+                // ]),
+                html!("div", {
+                    .style("height", "5rem")
+                }),
+                // Render our button with animated text inside.
+                Button::ghost().render(vec![
+                    text("Leif Adamec Rydenfalk").large_title(),
+                ], move |event| {
+                    match event {
+                        ButtonEvent::Clicked => {
+
+                        }
+                    }
+                }),
+                html!("div", {
+                    .style("height", "1rem")
+                }),
+                Button::ghost().render(vec![
+                    Icon::Plus::render(),
+                ], move |event| {
+                    match event {
+                        ButtonEvent::Clicked => {
+
+                        }
+                    }
+                }),
+                html!("div", {
+                    .style("height", "100vh")
+                }),
+            ])
+        }),
+    );
+
+    // Delay the IntersectionObserver setup so the elements are available.
+    spawn_local(async {
+        TimeoutFuture::new(100).await;
+        setup_intersection_observer();
+    });
+
+    Ok(())
+}
+
+
+#[derive(Clone, Copy)]
+enum ButtonEvent {
+    Clicked,
+}
+
+enum ButtonStyle {
+    Ghost,
+    Primary,
+}
+
+// -------------------------------------------------------------------
+// Button widget using spring animations.
+// -------------------------------------------------------------------
+struct Button {
+    style: ButtonStyle,
+}
+
+impl Button {
+    fn ghost() -> Self {
+        Self {
+            style: ButtonStyle::Ghost,
+        }
+    }
+
+    fn render<B, C, F>(self, children: C, on_event: F) -> Dom
+    where
+        B: std::borrow::BorrowMut<Dom>,
+        C: IntoIterator<Item = B>,
+        F: FnMut(ButtonEvent) + 'static,
+    {
+        static INNER_CLASS: Lazy<String> = Lazy::new(|| {
+            class! {
+                .style("display", "inline-block")
+                .style("background", "white")
+                .style("border", "2px solid rgba(0, 0, 0, 0.4)")
+                .style("color", "black")
+                .style("padding", "1rem")
+                .style("border-radius", "1rem")
+                .style("box-shadow", "rgba(100, 100, 111, 0.5) 0px 7px 29px 0px")
+            }
+            .into()
+        });
+
+        let event_dispatcher = Rc::new(EventDispatcher::new(on_event));
+
+        // Create a new button spring via the thread-local global animation handler.
+        let button_spring =
+            GLOBAL_ANIMATION_HANDLER.with(|handler| handler.add_spring(&BUTTON_SPRING_CONFIG));
+
+        let button_opacity = Rc::new(MutableAnimation::new(100.0));
+        let button_opacity_2 = button_opacity.clone();
+        let button_opacity_3 = button_opacity.clone();
+
+        html!("div", {
+            .children(&mut [
+                html!("div", {
+                    .class(&*INNER_CLASS)
+                    .children(children)
+
+                    // // Reveal animation
+                    // .future(button_spring.signal().for_each(clone!(button_spring => move |t| {
+
+                    //     async {}
+                    // })))
+
+                    // On mouse enter, set the spring target to 1.0 (hovered).
+                    .event(clone!(button_spring => move |_: events::MouseEnter| {
+                        button_spring.set_target(1.0);
+                        button_opacity.animate_to(Percentage::new(1.0));
+                    }))
+                    // On mouse leave, set the spring target back to 0.0.
+                    .event(clone!(button_spring => move |_: events::MouseLeave| {
+                        button_spring.set_target(0.0);
+                        button_opacity_2.animate_to(Percentage::new(0.0));
+                    }))
+                    // On mouse down, set the spring target to 2.0 (pressed).
+                    .event(clone!(button_spring => move |_: events::MouseDown| {
+                        button_spring.set_target(2.0);
+                    }))
+                    // On mouse up, set the spring target back to 1.0. Trigger the button action
+                    .event(clone!(button_spring => move |_: events::MouseUp| {
+                        button_spring.set_target(1.0);
+                        // Trigger action here.
+                        event_dispatcher.send(ButtonEvent::Clicked);
+                    }))
+                    // Animate opacity using normal easing.
+                    .style_signal("opacity", map_ref! {
+                        let opacity = button_opacity_3.signal().map(|t| easing::in_out(t, easing::cubic)) =>
+                        Some(format!("{}", opacity.range_inclusive(1.0, 0.7)))
+                    })
+                    .style_signal("transform", button_spring.value_mut.signal().map(|val| {
+                        let scale = 1.0 - 0.05 * val; // map 0.0→1.0 to scale 1.0→0.95.
+                        format!("scale({})", scale)
+                    }))
+                })
+            ])
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct EventDispatcher<A, F> {
+    listener: Arc<Mutex<F>>,
+    argument: PhantomData<A>,
+}
+
+impl<A, F> Clone for EventDispatcher<A, F> {
+    #[inline]
+    fn clone(&self) -> Self {
+        EventDispatcher {
+            listener: self.listener.clone(),
+            argument: self.argument,
+        }
+    }
+}
+
+impl<A, F> EventDispatcher<A, F>
+where
+    F: FnMut(A),
+{
+    #[inline]
+    pub fn new(listener: F) -> Self {
+        Self {
+            listener: Arc::new(Mutex::new(listener)),
+            argument: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn send(&self, event: A) {
+        let listener = &mut *self.listener.lock().unwrap();
+        listener(event);
+    }
+}
+
+// -------------------------------------------------------------------
+// Entry point.
+// -------------------------------------------------------------------
+#[wasm_bindgen(start)]
+pub fn main_js() -> Result<(), JsValue> {
+    // Enable better panic messages.
+    #[cfg(debug_assertions)]
+    console_error_panic_hook::set_once();
+
+    // Append our DOM to the body.
+    dominator::append_dom(
+        &dominator::body(),
+        html!("div", {
+            .children(&mut [
+                Button::ghost().render(vec![
+                    Icon::Plus.render(),
+                ], move |event| {
+                    match event {
+                        ButtonEvent::Clicked => {
+
+                        }
+                    }
+                }),
+                html!("div", {
+                    .style("height", "100vh")
+                }),
+            ])
+        }),
+    );
+
+    Ok(())
+}
