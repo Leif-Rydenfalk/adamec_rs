@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body,
+html {
+	overflow: hidden;
+}
+
+/* body {
+	font-family: 'Sniglet', serif;
+	font-weight: 400;
+	font-style: normal;
+} */
+
+body {
+	@apply bg-gray-100 text-blue-500 text-xl;
+	font-family: 'Open Sans', serif;
+	font-optical-sizing: auto;
+	font-weight: 400;
+	font-style: normal;
+	font-variation-settings: 'wdth' 100;
+}

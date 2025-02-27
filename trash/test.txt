@@ -1,0 +1,40 @@
+
+/// Example function that renders various icon sizes.
+fn icon_test() -> Dom {
+    html!("div", {
+        .children(&mut [
+            icon(Icon::Plus).large_title(),
+            icon(Icon::Plus).title(),
+            icon(Icon::Plus).title2(),
+            icon(Icon::Plus).title3(),
+            icon(Icon::Plus).headline(),
+            icon(Icon::Plus).body(),
+            icon(Icon::Plus).callout(),
+            icon(Icon::Plus).subheadline(),
+            icon(Icon::Plus).footnote(),
+            icon(Icon::Plus).caption(),
+            icon(Icon::Plus).caption2(),
+            icon(Icon::Plus).custom(FontStyle::new(18.0, 24.0).weight("500").italic()),
+        ])
+    })
+}
+
+/// Example function that renders text in various styles.
+fn text_test() -> Dom {
+    html!("div", {
+        .children(&mut [
+            text("Large Title").large_title(),
+            text("Title").title(),
+            text("Title 2").title2(),
+            text("Title 3").title3(),
+            text("Headline").headline(),
+            text("Body").body(),
+            text("Callout").callout(),
+            text("Subheadline").subheadline(),
+            text("Footnote").footnote(),
+            text("Caption").caption(),
+            text("Caption2").caption2(),
+            text("Custom Text").custom(FontStyle::new(18.0, 24.0).weight("500").italic()),
+        ])
+    })
+}
